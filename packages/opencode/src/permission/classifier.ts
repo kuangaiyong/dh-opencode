@@ -187,8 +187,18 @@ export namespace Classifier {
             })
 
             if (stage1Result.decision === "allow") {
-                DenialTracker.recordApproval()
-                return { decision: "allow", stage: 1, durationMs: duration1 }
+                // High-risk permissions: even if Stage 1 allows, require Stage 2 confirmation
+                // to reduce false-positive auto-approvals for dangerous tool categories.
+                if (HIGH_RISK_PERMISSIONS.has(input.permission)) {
+                    log.info("high-risk permission, requiring Stage 2 confirmation", {
+                        permission: input.permission,
+                        duration: duration1,
+                    })
+                    // Fall through to Stage 2
+                } else {
+                    DenialTracker.recordApproval()
+                    return { decision: "allow", stage: 1, durationMs: duration1 }
+                }
             }
 
             // 9. Stage 2: Deep classification (Stage 1 blocked)

@@ -46,6 +46,7 @@ import { Truncate } from "@/tool/truncate"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Memory } from "@/memory"
+import { Classifier } from "@/permission/classifier"
 import { Cause, Effect, Exit, Layer, Option, Scope, ServiceMap } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { makeRuntime } from "@/effect/run-service"
@@ -1300,6 +1301,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
       const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
         function* (input: PromptInput) {
+          // Reset classifier denial tracking on each new user prompt
+          // to prevent accumulated denials from permanently disabling the classifier.
+          Classifier.reset()
+
           const session = yield* sessions.get(input.sessionID)
           yield* Effect.promise(() => SessionRevert.cleanup(session))
           const message = yield* createUserMessage(input)

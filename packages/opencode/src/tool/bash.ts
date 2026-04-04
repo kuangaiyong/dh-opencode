@@ -18,6 +18,10 @@ import { Shell } from "@/shell/shell"
 import { BashArity } from "@/permission/arity"
 import { Truncate } from "./truncate"
 import { Plugin } from "@/plugin"
+import { Config } from "@/config/config"
+import { validateBashCommand } from "@/security/bash-security"
+import { isReadOnlyCommand } from "@/security/readonly-commands"
+import { isReadOnlyPowerShellCommand } from "@/security/readonly-powershell"
 
 const MAX_METADATA_LENGTH = 30_000
 const DEFAULT_TIMEOUT = Flag.OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS || 2 * 60 * 1000
@@ -262,7 +266,7 @@ async function parse(command: string, ps: boolean) {
   return tree.rootNode
 }
 
-async function ask(ctx: Tool.Context, scan: Scan) {
+async function ask(ctx: Tool.Context, scan: Scan, securityMessage?: string, readonlyApproved?: boolean) {
   if (scan.dirs.size > 0) {
     const globs = Array.from(scan.dirs).map((dir) => {
       if (process.platform === "win32") return Filesystem.normalizePathPattern(path.join(dir, "*"))
@@ -277,11 +281,25 @@ async function ask(ctx: Tool.Context, scan: Scan) {
   }
 
   if (scan.patterns.size === 0) return
+
+  // ── Read-only auto-approval ──
+  // If the command passed read-only validation (no file writes, no code exec,
+  // no network requests), skip the bash permission prompt entirely.
+  // SECURITY: This is NEVER applied when bash security flagged the command
+  // (securityMessage is set), as the caller ensures readonlyApproved=false
+  // when securityMessage is present.
+  if (readonlyApproved) {
+    log.info("read-only auto-approved, skipping bash permission prompt", {
+      patterns: Array.from(scan.patterns).slice(0, 3),
+    })
+    return
+  }
+
   await ctx.ask({
     permission: "bash",
     patterns: Array.from(scan.patterns),
     always: Array.from(scan.always),
-    metadata: {},
+    metadata: securityMessage ? { bashSecurityMessage: securityMessage } : {},
   })
 }
 
@@ -481,7 +499,52 @@ export const BashTool = Tool.define("bash", async () => {
       const root = await parse(params.command, ps)
       const scan = await collect(root, cwd, ps, shell)
       if (!Instance.containsPath(cwd)) scan.dirs.add(cwd)
-      await ask(ctx, scan)
+
+      // ── Bash security validation ──
+      // Check command for injection attacks, dangerous patterns, parser-differential exploits.
+      // When unsafe, the metadata flags are passed to the permission system so the classifier
+      // knows not to auto-approve, and the user sees the security concern message.
+      let bashSecurityMessage: string | undefined
+      let bashSecurityIsMisparsing = false
+      const cfg = await Config.get()
+      if (cfg.experimental?.bash_security !== false) {
+        const secResult = validateBashCommand(params.command)
+        if (!secResult.safe) {
+          bashSecurityMessage = secResult.message
+          bashSecurityIsMisparsing = secResult.isMisparsing
+          log.info("bash security validation failed", {
+            message: secResult.message,
+            isMisparsing: secResult.isMisparsing,
+            command: params.command.slice(0, 200),
+          })
+        }
+      }
+
+      // ── Read-only command auto-approval ──
+      // If the command is purely read-only (no file writes, no code exec, no network),
+      // skip the bash permission prompt. This avoids unnecessary user interruptions
+      // for safe commands like `git status`, `ls -la`, `cat file.txt`, etc.
+      // SECURITY: Never auto-approve if bash security flagged the command as unsafe.
+      // Reference: Claude Code readOnlyValidation.ts checkReadOnlyConstraints()
+      let readonlyApproved = false
+      if (!bashSecurityMessage && cfg.experimental?.readonly_auto_approve !== false) {
+        const roResult = ps
+          ? isReadOnlyPowerShellCommand(params.command)
+          : isReadOnlyCommand(params.command)
+        if (roResult.readonly) {
+          readonlyApproved = true
+          log.info("read-only command detected, will auto-approve", {
+            command: params.command.slice(0, 200),
+          })
+        } else {
+          log.info("command is not read-only", {
+            reason: roResult.reason,
+            command: params.command.slice(0, 200),
+          })
+        }
+      }
+
+      await ask(ctx, scan, bashSecurityMessage, readonlyApproved)
 
       return run(
         {

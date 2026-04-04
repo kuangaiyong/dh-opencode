@@ -67,6 +67,13 @@ export const DANGEROUS_BASH_PATTERNS: readonly RegExp[] = [
     /\b(?:shutdown|reboot|halt|poweroff)\b/i, // shutdown/reboot
     /\bkill\s+-9\s+1\b/i,                 // kill -9 1 (init process)
     /\b(?:rm|del)\s+.*(?:\/etc\/|\\windows\\)/i, // remove system files
+    // Windows-specific dangerous patterns
+    /\b(?:powershell|pwsh)(?:\.exe)?\s+.*-(?:e|enc|encodedcommand)\b/i, // encoded PowerShell
+    /\b(?:cmd|cmd\.exe)\s+\/c\b/i,        // cmd /c arbitrary execution
+    /\breg\s+(?:add|delete|import)\b/i,    // Windows registry modification
+    /\bformat\s+[a-z]:/i,                  // format drive
+    /\bnet\s+user\b/i,                     // user account modification
+    /\bbcdedit\b/i,                         // boot config modification
 ]
 
 /**
@@ -96,6 +103,11 @@ export const CODE_EXEC_PREFIXES: readonly string[] = [
     "bash",
     "sh",
     "zsh",
+    // Windows shells
+    "powershell",
+    "pwsh",
+    "cmd",
+    "cmd.exe",
     // Remote execution
     "ssh",
     "eval",

@@ -18,6 +18,8 @@ import { evaluate as evalRule } from "./evaluate"
 import { PermissionID } from "./schema"
 import { Classifier } from "./classifier"
 import { MessageV2 } from "@/session/message-v2"
+import { checkPathsSafety } from "@/security/path-safety"
+import { stripDangerousRules } from "@/permission/dangerous-rules"
 
 export namespace Permission {
   const log = Log.create({ service: "permission" })
@@ -172,8 +174,33 @@ export namespace Permission {
         const { ruleset, ...request } = input
         let needsAsk = false
 
+        // ── Dangerous rule stripping: prevent overly broad allow rules from bypassing classifier ──
+        // When the AI classifier is enabled, rules like `bash: * → allow` or
+        // `bash: python * → allow` would short-circuit to "allow" before the
+        // classifier gets a chance to evaluate safety. Strip these rules so
+        // the classifier can do its job.
+        // NOTE: Only strips from the config/project ruleset, NOT from `approved`
+        // (session-level rules the user explicitly approved are always honored).
+        let effectiveRuleset = ruleset
+        const classifierCfg = yield* Effect.tryPromise({
+          try: async () => {
+            const cfg = await Config.get()
+            return cfg.classifier?.enabled === true
+          },
+          catch: () => false, // fail-open: if config fails, don't strip rules
+        })
+        if (classifierCfg) {
+          effectiveRuleset = stripDangerousRules(ruleset)
+          if (effectiveRuleset !== ruleset) {
+            log.info("stripped dangerous rules from ruleset for classifier safety", {
+              original: ruleset.length,
+              filtered: effectiveRuleset.length,
+            })
+          }
+        }
+
         for (const pattern of request.patterns) {
-          const rule = evaluate(request.permission, pattern, ruleset, approved)
+          const rule = evaluate(request.permission, pattern, effectiveRuleset, approved)
           log.info("evaluated", { permission: request.permission, pattern, action: rule })
           if (rule.action === "deny") {
             return yield* new DeniedError({
@@ -186,100 +213,159 @@ export namespace Permission {
 
         if (!needsAsk) return
 
+        // ── Path Safety: block dangerous paths before acceptEdits / classifier ──
+        // Reference: Claude Code filesystem.ts checkPathSafetyForAutoEdit
+        // Checks for: dangerous files (.bashrc, .gitconfig), dangerous dirs (.git, .vscode),
+        // Windows NTFS attacks (ADS, 8.3 shortnames, device names), UNC paths, etc.
+        let skipAcceptEdits = false
+        let skipClassifier = false
+        const pathSafetyEnabled = yield* Effect.tryPromise({
+          try: async () => {
+            const cfg = await Config.get()
+            return cfg.experimental?.path_safety !== false // default: enabled
+          },
+          catch: () => true, // fail-closed: treat as enabled
+        })
+        if (pathSafetyEnabled) {
+          const pathResult = checkPathsSafety(request.patterns)
+          if (!pathResult.safe) {
+            log.info("path safety check failed", {
+              message: pathResult.message,
+              classifierApprovable: pathResult.classifierApprovable,
+              patterns: request.patterns,
+            })
+            skipAcceptEdits = true
+            if (!pathResult.classifierApprovable) {
+              skipClassifier = true
+            }
+          }
+        }
+
+        // ── Bash Security: check if bash tool flagged the command as unsafe ──
+        // When metadata.bashSecurityMessage is set, the bash command failed
+        // security validation. Skip classifier for misparsing exploits.
+        if (request.metadata?.bashSecurityMessage) {
+          log.info("bash security metadata present, skipping acceptEdits", {
+            message: request.metadata.bashSecurityMessage,
+          })
+          skipAcceptEdits = true
+          // Misparsing exploits (parser differential attacks) should never be
+          // auto-approved by the classifier — always escalate to user.
+          skipClassifier = true
+        }
+
         // ── acceptEdits fast path: auto-approve file edits within project directory ──
         // Reference: Claude Code permissions.ts acceptEdits fast path
         // This avoids unnecessary LLM classifier calls for normal project file edits.
+        // SECURITY: Skipped when path safety or bash security flags the request.
         const ACCEPT_EDITS_TOOLS = new Set(["edit", "write", "apply_patch", "multiedit"])
         if (
+          !skipAcceptEdits &&
           request.permission === "edit" &&
           request.toolName &&
           ACCEPT_EDITS_TOOLS.has(request.toolName)
         ) {
           const worktree = Instance.worktree
-          const allInProject = request.patterns.every((p) => {
-            // Relative paths are inherently within the project
-            if (!path.isAbsolute(p)) return true
-            // Absolute paths must be within the project worktree
-            const normalized = path.normalize(p)
-            return normalized.startsWith(path.normalize(worktree))
-          })
-          if (allInProject) {
-            log.info("acceptEdits fast path: project-local edit auto-approved", {
-              toolName: request.toolName,
-              patterns: request.patterns,
+          // SECURITY: Non-git projects set worktree to "/" (or "\" on Windows).
+          // Skip fast path entirely in this case — otherwise ALL absolute paths
+          // would be auto-approved since everything starts with "/".
+          if (worktree !== "/" && worktree !== "\\") {
+            const allInProject = request.patterns.every((p) => {
+              // Relative paths are inherently within the project
+              if (!path.isAbsolute(p)) return true
+              // Absolute paths must be within the project worktree
+              const normalized = path.normalize(p)
+              return normalized.startsWith(path.normalize(worktree))
             })
-            return
+            if (allInProject) {
+              log.info("acceptEdits fast path: project-local edit auto-approved", {
+                toolName: request.toolName,
+                patterns: request.patterns,
+              })
+              return
+            }
           }
         }
 
         // ── AI Classifier: attempt to auto-approve safe tool calls ──
+        // SECURITY: Skipped when path safety or bash security flags classifierApprovable=false
+        // (e.g. NTFS attack patterns, parser differential exploits).
 
         // Fetch recent session context for the classifier (best-effort, non-blocking)
         let sessionContext: Array<{ role: string; summary: string }> | undefined
-        const sessionContextResult = yield* Effect.tryPromise({
-          try: () =>
-            MessageV2.page({
-              sessionID: request.sessionID,
-              limit: 10,
-            }),
-          catch: () => undefined,
-        }).pipe(Effect.option)
+        if (!skipClassifier) {
+          const sessionContextResult = yield* Effect.tryPromise({
+            try: () =>
+              MessageV2.page({
+                sessionID: request.sessionID,
+                limit: 10,
+              }),
+            catch: () => undefined,
+          }).pipe(Effect.option)
 
-        if (sessionContextResult._tag === "Some" && sessionContextResult.value) {
-          const recentMessages = sessionContextResult.value
-          if (recentMessages.items.length > 0) {
-            sessionContext = recentMessages.items
-              .map((msg) => {
-                const role = msg.info.role
-                // Extract text content as summary
-                const textParts = msg.parts
-                  .filter((p): p is MessageV2.TextPart => p.type === "text")
-                  .map((p) => p.text)
-                const summary = textParts.join(" ").slice(0, 300) || `[${role} message]`
-                return { role, summary }
-              })
-              .slice(-5) // Keep last 5 messages
+          if (sessionContextResult._tag === "Some" && sessionContextResult.value) {
+            const recentMessages = sessionContextResult.value
+            if (recentMessages.items.length > 0) {
+              sessionContext = recentMessages.items
+                .map((msg) => {
+                  const role = msg.info.role
+                  // Extract text content as summary
+                  const textParts = msg.parts
+                    .filter((p): p is MessageV2.TextPart => p.type === "text")
+                    .map((p) => p.text)
+                  const summary = textParts.join(" ").slice(0, 300) || `[${role} message]`
+                  return { role, summary }
+                })
+                .slice(-5) // Keep last 5 messages
+            }
           }
         }
 
-        const classifyResult = yield* Effect.tryPromise({
-          try: () =>
-            Classifier.classify({
+        if (!skipClassifier) {
+          const classifyResult = yield* Effect.tryPromise({
+            try: () =>
+              Classifier.classify({
+                permission: request.permission,
+                patterns: request.patterns,
+                metadata: request.metadata,
+                toolName: request.toolName,
+                sessionContext,
+              }),
+            catch: () => "classifier-error" as const,
+          }).pipe(Effect.option)
+
+          if (classifyResult._tag === "Some" && classifyResult.value.decision === "allow") {
+            log.info("classifier auto-approved", {
               permission: request.permission,
               patterns: request.patterns,
-              metadata: request.metadata,
               toolName: request.toolName,
-              sessionContext,
-            }),
-          catch: () => "classifier-error" as const,
-        }).pipe(Effect.option)
-
-        if (classifyResult._tag === "Some" && classifyResult.value.decision === "allow") {
-          log.info("classifier auto-approved", {
+              stage: classifyResult.value.stage,
+              durationMs: classifyResult.value.durationMs,
+              reasoning: classifyResult.value.reasoning?.slice(0, 200),
+            })
+            return
+          }
+          if (classifyResult._tag === "Some") {
+            log.info("classifier escalated to user", {
+              permission: request.permission,
+              patterns: request.patterns,
+              toolName: request.toolName,
+              decision: classifyResult.value.decision,
+              stage: classifyResult.value.stage,
+              durationMs: classifyResult.value.durationMs,
+              reasoning: classifyResult.value.reasoning?.slice(0, 200),
+            })
+          }
+          if (classifyResult._tag === "None") {
+            log.warn("classifier returned no result (error), falling back to user prompt", {
+              permission: request.permission,
+              toolName: request.toolName,
+            })
+          }
+        } else {
+          log.info("classifier skipped due to security checks (non-classifier-approvable)", {
             permission: request.permission,
             patterns: request.patterns,
-            toolName: request.toolName,
-            stage: classifyResult.value.stage,
-            durationMs: classifyResult.value.durationMs,
-            reasoning: classifyResult.value.reasoning?.slice(0, 200),
-          })
-          return
-        }
-        if (classifyResult._tag === "Some") {
-          log.info("classifier escalated to user", {
-            permission: request.permission,
-            patterns: request.patterns,
-            toolName: request.toolName,
-            decision: classifyResult.value.decision,
-            stage: classifyResult.value.stage,
-            durationMs: classifyResult.value.durationMs,
-            reasoning: classifyResult.value.reasoning?.slice(0, 200),
-          })
-        }
-        if (classifyResult._tag === "None") {
-          log.warn("classifier returned no result (error), falling back to user prompt", {
-            permission: request.permission,
-            toolName: request.toolName,
           })
         }
 
@@ -372,7 +458,7 @@ export namespace Permission {
     if (pattern.startsWith("~/")) return os.homedir() + pattern.slice(1)
     if (pattern === "~") return os.homedir()
     if (pattern.startsWith("$HOME/")) return os.homedir() + pattern.slice(5)
-    if (pattern.startsWith("$HOME")) return os.homedir() + pattern.slice(5)
+    if (pattern === "$HOME") return os.homedir()
     return pattern
   }
 

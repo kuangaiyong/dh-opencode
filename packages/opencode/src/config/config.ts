@@ -1099,6 +1099,18 @@ export namespace Config {
             .positive()
             .optional()
             .describe("Timeout in milliseconds for model context protocol (MCP) requests"),
+          path_safety: z
+            .boolean()
+            .optional()
+            .describe("Enable path safety checks that block auto-approval of dangerous file paths (.git, .bashrc, NTFS attacks, etc.). Default: true"),
+          bash_security: z
+            .boolean()
+            .optional()
+            .describe("Enable bash command security validation (injection detection, dangerous patterns, etc.). Default: true"),
+          readonly_auto_approve: z
+            .boolean()
+            .optional()
+            .describe("Enable auto-approval of read-only bash commands (git status, ls, cat, etc.). Default: true"),
         })
         .optional(),
     })
