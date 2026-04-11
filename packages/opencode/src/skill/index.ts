@@ -17,6 +17,7 @@ import { ConfigMarkdown } from "../config/markdown"
 import { Glob } from "../util/glob"
 import { Log } from "../util/log"
 import { Discovery } from "./discovery"
+import { SkillManager } from "./manager"
 
 export namespace Skill {
   const log = Log.create({ service: "skill" })
@@ -61,6 +62,9 @@ export namespace Skill {
     readonly all: () => Effect.Effect<Info[]>
     readonly dirs: () => Effect.Effect<string[]>
     readonly available: (agent?: Agent.Info) => Effect.Effect<Info[]>
+    readonly create: (input: { name: string; description: string; content: string }, opts?: { force?: boolean }) => Effect.Effect<SkillManager.SkillResult>
+    readonly update: (input: { name: string; description: string; content: string }, opts?: { force?: boolean }) => Effect.Effect<SkillManager.SkillResult>
+    readonly remove: (name: string) => Effect.Effect<SkillManager.SkillResult>
   }
 
   const add = Effect.fnUntraced(function* (state: State, match: string, bus: Bus.Interface) {
@@ -226,7 +230,42 @@ export namespace Skill {
         return list.filter((skill) => Permission.evaluate("skill", skill.name, agent.permission).action !== "deny")
       })
 
-      return Service.of({ get, all, dirs, available })
+      const create = Effect.fn("Skill.create")(function* (
+        input: { name: string; description: string; content: string },
+        opts?: { force?: boolean },
+      ) {
+        const result = yield* Effect.promise(() => SkillManager.create(input, opts))
+        if (result.success && result.path) {
+          // Reload skill into state
+          yield* add(yield* InstanceState.get(state), result.path, bus)
+        }
+        return result
+      })
+
+      const update = Effect.fn("Skill.update")(function* (
+        input: { name: string; description: string; content: string },
+        opts?: { force?: boolean },
+      ) {
+        const result = yield* Effect.promise(() => SkillManager.edit(input, opts))
+        if (result.success && result.path) {
+          // Reload skill into state
+          const s = yield* InstanceState.get(state)
+          yield* add(s, result.path, bus)
+        }
+        return result
+      })
+
+      const remove = Effect.fn("Skill.remove")(function* (name: string) {
+        const result = yield* Effect.promise(() => SkillManager.remove(name))
+        if (result.success) {
+          // Remove from state
+          const s = yield* InstanceState.get(state)
+          delete s.skills[name]
+        }
+        return result
+      })
+
+      return Service.of({ get, all, dirs, available, create, update, remove })
     }),
   )
 
@@ -273,5 +312,17 @@ export namespace Skill {
 
   export async function available(agent?: Agent.Info) {
     return runPromise((skill) => skill.available(agent))
+  }
+
+  export async function create(input: { name: string; description: string; content: string }, opts?: { force?: boolean }) {
+    return runPromise((skill) => skill.create(input, opts))
+  }
+
+  export async function update(input: { name: string; description: string; content: string }, opts?: { force?: boolean }) {
+    return runPromise((skill) => skill.update(input, opts))
+  }
+
+  export async function remove(name: string) {
+    return runPromise((skill) => skill.remove(name))
   }
 }

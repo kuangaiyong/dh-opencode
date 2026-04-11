@@ -31,6 +31,7 @@ import { MemorySearchTool } from "./memory-search"
 import { MemoryGetTool } from "./memory-get"
 import { MemoryStoreTool } from "./memory-store"
 import { MemoryForgetTool } from "./memory-forget"
+import { SkillManageTool } from "./skill-manage"
 import { Glob } from "../util/glob"
 import { pathToFileURL } from "url"
 import { Effect, Layer, ServiceMap } from "effect"
@@ -138,6 +139,7 @@ export namespace ToolRegistry {
           ...(cfg.memory?.enabled ? [MemorySearchTool, MemoryGetTool, MemoryStoreTool, MemoryForgetTool] : []),
           ...(Flag.OPENCODE_EXPERIMENTAL_LSP_TOOL ? [LspTool] : []),
           ...(cfg.experimental?.batch_tool === true ? [BatchTool] : []),
+          ...(cfg.experimental?.skill_management === true ? [SkillManageTool] : []),
           ...(Flag.OPENCODE_EXPERIMENTAL_PLAN_MODE && Flag.OPENCODE_CLIENT === "cli" ? [PlanExitTool] : []),
           ...custom,
         ]

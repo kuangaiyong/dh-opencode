@@ -47,6 +47,8 @@ import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Memory } from "@/memory"
 import { Classifier } from "@/permission/classifier"
+import * as Nudge from "@/evolution/nudge"
+import { spawnBackgroundReview } from "@/evolution/review"
 import { Cause, Effect, Exit, Layer, Option, Scope, ServiceMap } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { makeRuntime } from "@/effect/run-service"
@@ -1341,6 +1343,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           let step = 0
           const session = yield* sessions.get(sessionID)
 
+          // Evolution nudge: check if memory review should trigger on this user turn
+          let shouldReviewMemory = false
+          let shouldReviewSkills = false
+          const isRootSession = !session.parentID
+          if (isRootSession) {
+            const evoConfig = yield* Effect.promise(() => Nudge.getEvolutionConfig())
+            if (evoConfig.enabled) {
+              shouldReviewMemory = Nudge.recordUserTurn(sessionID, {
+                memoryNudgeInterval: evoConfig.memoryNudgeInterval,
+                memoryEnabled: evoConfig.memoryEnabled,
+              })
+            }
+          }
+
           while (true) {
             yield* status.set(sessionID, { type: "busy" })
             log.info("loop", { step, sessionID })
@@ -1372,6 +1388,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
 
             step++
+            // Evolution nudge: track tool iterations for skill review
+            if (isRootSession) Nudge.recordToolIteration(sessionID)
             if (step === 1)
               yield* title({
                 session,
@@ -1591,6 +1609,26 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             )
             if (outcome === "break") break
             continue
+          }
+
+          // Evolution nudge: check skill trigger and spawn background review
+          if (isRootSession) {
+            const evoConfig = yield* Effect.promise(() => Nudge.getEvolutionConfig())
+            if (evoConfig.enabled) {
+              shouldReviewSkills = Nudge.checkSkillNudge(sessionID, {
+                skillNudgeInterval: evoConfig.skillNudgeInterval,
+                skillManagementEnabled: evoConfig.skillManagementEnabled,
+              })
+              if (shouldReviewMemory || shouldReviewSkills) {
+                yield* Effect.promise(() =>
+                  spawnBackgroundReview({
+                    sessionID,
+                    reviewMemory: shouldReviewMemory,
+                    reviewSkills: shouldReviewSkills,
+                  }),
+                ).pipe(Effect.ignore, Effect.forkIn(scope))
+              }
+            }
           }
 
           yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))

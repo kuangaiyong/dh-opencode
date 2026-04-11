@@ -1111,6 +1111,32 @@ export namespace Config {
             .boolean()
             .optional()
             .describe("Enable auto-approval of read-only bash commands (git status, ls, cat, etc.). Default: true"),
+          skill_management: z
+            .boolean()
+            .optional()
+            .describe("Enable the skill_manage tool for creating, editing, and deleting skills at runtime"),
+          evolution: z
+            .object({
+              enabled: z.boolean().optional().describe("Enable the evolution system (background review for memory/skill saves). Default: false"),
+              memory_nudge_interval: z
+                .number()
+                .int()
+                .positive()
+                .optional()
+                .describe("User turns between memory review nudges (default: 10, 0 = disabled)"),
+              skill_nudge_interval: z
+                .number()
+                .int()
+                .positive()
+                .optional()
+                .describe("Tool-call iterations between skill review nudges (default: 15, 0 = disabled)"),
+            })
+            .optional()
+            .describe("Evolution system configuration for automatic memory and skill review"),
+          compaction_strategy: z
+            .enum(["basic", "advanced"])
+            .optional()
+            .describe("Compaction strategy: 'basic' (default) uses standard prune + LLM summary; 'advanced' adds aggressive tool output truncation and boundary detection before summarization"),
         })
         .optional(),
     })
